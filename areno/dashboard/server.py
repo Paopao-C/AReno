@@ -27,6 +27,7 @@ from areno.cli.dashboard_registry import GLOBAL_REGISTRY_FILE
 from areno.cli.diagnostics import collect_env, run_checks
 from areno.dashboard.agent_context import agent_system_prompt
 from areno.dashboard.agent_files import AgentFileBrowser
+from areno.dashboard.events import detect_events_from_job_artifacts, filter_events
 
 ROOT = Path(os.environ.get("ARENO_DASHBOARD_ROOT", Path.cwd())).resolve()
 STATIC_DIR = Path(__file__).resolve().parent / "dist"
@@ -514,6 +515,21 @@ class DashboardState:
         ]
         points.sort(key=lambda point: int(point.get("step") or 0))
         return points[-max(1, min(limit, 5000)) :]
+
+    def job_events(self, job_id: str | None, event_types: list[str] | None = None) -> list[dict[str, Any]]:
+        """Detect structured training events for a job (issue #271).
+
+        Events are derived passively from the job's existing logs and metric
+        points — no trainer change and no mutation of stored metric data. A
+        legacy run with no recognizable log/metric signal simply yields an empty
+        list (backward compatible). `event_types` filters independently of the
+        metric curve shown; invalid types are ignored.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return []
+        events = detect_events_from_job_artifacts(log_lines=job.logs, metric_points=job.metrics)
+        return filter_events(events, event_types)
 
     def scan_registered_jobs(self) -> None:
         registry_jobs = registered_job_items()
@@ -1500,6 +1516,13 @@ class Handler(BaseHTTPRequestHandler):
                 metric_name = query.get("name", [""])[0]
                 limit = int(query.get("limit", ["500"])[0] or 500)
                 self.json({"metric": metric_name, "points": STATE.metric_series(job_id, metric_name, limit=limit)})
+            elif path.startswith("/api/jobs/") and path.endswith("/events"):
+                job_id = path.split("/")[-2]
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                # Optional ?type=nan,oom filter (independent of the shown curve).
+                raw_types = query.get("type", [""])[0]
+                event_types = [t for t in raw_types.split(",") if t] if raw_types else None
+                self.json({"events": STATE.job_events(job_id, event_types)})
             elif path.startswith("/api/jobs/"):
                 job = STATE.get_job(path.split("/")[-1])
                 if not job:

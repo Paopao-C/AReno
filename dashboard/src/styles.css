@@ -679,7 +679,7 @@ p {
 .chartControls {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
   gap: 10px;
   min-width: 0;
@@ -827,6 +827,148 @@ p {
   color: var(--deck-muted);
   border: 1px dashed var(--deck-line-strong);
   border-radius: var(--radius-md);
+}
+
+/* --- Training-event overlay (issue #271) --- */
+.eventFilterDropdown {
+  position: relative;
+  display: inline-block;
+  margin-left: auto;
+}
+
+.eventFilterBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--deck-line);
+  border-radius: var(--radius-sm);
+  background: #0b1118;
+  color: var(--deck-text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.eventFilterCaret {
+  color: var(--deck-muted);
+  font-size: 9px;
+}
+
+.eventFilterPanel {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 2px);
+  right: 0;
+  min-width: 150px;
+  border: 1px solid var(--deck-line);
+  border-radius: var(--radius-sm);
+  background: #0b1118;
+  padding: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.eventFilterItem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--deck-text);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.eventFilterItem:hover {
+  background: #111a24;
+}
+
+.eventFilterItemActive {
+  color: var(--deck-text);
+}
+
+.eventSwatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  border: 1px solid rgba(167, 186, 210, 0.3);
+  flex-shrink: 0;
+}
+
+.eventBadge {
+  cursor: pointer;
+}
+
+.eventBadge text {
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.eventPanel {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--deck-line);
+  border-radius: var(--radius-sm);
+  background: #0b1118;
+  color: var(--deck-text);
+  font-size: 11px;
+}
+
+.eventPanelHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.eventPanelCount {
+  color: var(--deck-muted);
+}
+
+.eventCardClose {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--deck-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.eventPanelRow {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0;
+  border-top: 1px solid var(--deck-line);
+}
+
+.eventPanelType {
+  font-weight: 600;
+  min-width: 52px;
+}
+
+.eventPanelMessage {
+  flex: 1;
+  min-width: 120px;
+  color: var(--deck-text);
+}
+
+.eventExcerpt {
+  margin: 2px 0 0;
+  padding: 6px;
+  width: 100%;
+  max-height: 120px;
+  overflow: auto;
+  background: #060a0f;
+  border: 1px solid var(--deck-line);
+  border-radius: var(--radius-sm);
+  color: var(--deck-muted);
+  font-size: 10px;
+  white-space: pre-wrap;
 }
 
 .timePerf {

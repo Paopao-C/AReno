@@ -1127,6 +1127,18 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
   const [points, setPoints] = useState([]);
   const [metricLoading, setMetricLoading] = useState(false);
   const [prevJobId, setPrevJobId] = useState(jobId);
+  // Issue #271: structured training-event overlay. Events are fetched
+  // independently of the metric curve and filtered by a multi-select dropdown.
+  // Each step with events shows a count badge on an independent event axis at
+  // the top of the chart (positioned by the events' own step range, not the
+  // curve's, so events at steps without a metric point still appear). Clicking
+  // a badge expands an inline panel listing that step's events with a bounded
+  // log excerpt (never full training samples). Default: all four event types
+  // shown; legacy runs without recognizable signal render no badges.
+  const [events, setEvents] = useState([]);
+  const [eventFilter, setEventFilter] = useState(["non_finite", "oom", "invalid_batch", "constant_reward"]);
+  const [activeEventStep, setActiveEventStep] = useState(null);
+  const [eventFilterOpen, setEventFilterOpen] = useState(false);
   // Reset the selection during render (not in an effect) when the job changes so
   // the reset happens before any effect runs. This avoids a stale-name fetch and
   // a stuck loading state on job switch, while live polls (refreshNonce) still
@@ -1137,6 +1149,8 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
     setMetricList([]);
     setPoints([]);
     setMetricLoading(false);
+    setEvents([]);
+    setActiveEventStep(null);
   }
   const names = metricNamesFrom(metricList);
   const effectiveName = resolveActiveMetricName(names, selectedName);
@@ -1184,10 +1198,56 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
       cancelled = true;
     };
   }, [jobId, effectiveName, refreshNonce]);
+  // Fetch events independently of the metric curve; refresh with the same nonce
+  // so live runs show new markers without replotting the curve. Legacy runs
+  // (no recognizable signal) return an empty list and render nothing extra.
+  useEffect(() => {
+    let cancelled = false;
+    if (!jobId) {
+      setEvents([]);
+      return undefined;
+    }
+    api(`/api/jobs/${jobId}/events`)
+      .then((data) => {
+        if (!cancelled) setEvents(data.events || []);
+      })
+      .catch(() => {
+        if (!cancelled) setEvents([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, refreshNonce]);
   const activeName = effectiveName;
   const visiblePoints = points.slice(-240);
   const smoothed = smoothTensorboard(visiblePoints, smooth);
   const plot = buildMetricPlot(visiblePoints, smoothed);
+  // Issue #271: event overlay lives on its own axis at the chart top. Position
+  // badges by the events' own step range (not the curve's visible window), so a
+  // step that has an event but no metric point (e.g. an OOM step that produced
+  // no loss) still renders its badge. Group filtered events by step for count
+  // badges; clicking a badge expands that step's detail inline.
+  const filteredEvents = events.filter((event) => eventFilter.includes(event.type));
+  const eventsByStep = useMemo(() => {
+    const grouped = {};
+    for (const event of filteredEvents) {
+      (grouped[event.step] ||= []).push(event);
+    }
+    return grouped;
+  }, [filteredEvents]);
+  const eventSteps = Object.keys(eventsByStep).map(Number).sort((a, b) => a - b);
+  const eventStepMin = eventSteps.length ? eventSteps[0] : 0;
+  const eventStepMax = eventSteps.length ? eventSteps[eventSteps.length - 1] : 1;
+  const eventStepSpan = Math.max(eventStepMax - eventStepMin, 1);
+  const eventXOf = (step) => {
+    if (!eventSteps.length) return 0;
+    return ((step - eventStepMin) / eventStepSpan) * 700 + 10;
+  };
+  const EVENT_COLORS = { non_finite: "#e07b7b", oom: "#b07bed", invalid_batch: "#e0c24a", constant_reward: "#6bb4e9" };
+  const EVENT_BADGE_MULTI = "#9aa6b2"; // neutral grey for steps with >1 event
+  const EVENT_LABELS = { non_finite: "NaN", oom: "OOM", invalid_batch: "invalid", constant_reward: "const" };
+  const EVENT_TYPES_ALL = ["non_finite", "oom", "invalid_batch", "constant_reward"];
+  const activeStepEvents = activeEventStep === null ? [] : eventsByStep[activeEventStep] || [];
   return (
     <div className="chart">
       <div className="chartHeader">
@@ -1200,6 +1260,15 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
             smooth {smooth.toFixed(2)}
             <input type="range" min="0" max="0.99" step="0.01" value={smooth} onChange={(event) => setSmooth(Number(event.target.value))} />
           </label>
+          <EventFilterDropdown
+            eventFilter={eventFilter}
+            setEventFilter={setEventFilter}
+            open={eventFilterOpen}
+            setOpen={setEventFilterOpen}
+            colors={EVENT_COLORS}
+            labels={EVENT_LABELS}
+            types={EVENT_TYPES_ALL}
+          />
         </div>
       </div>
       {visiblePoints.length === 0 ? (
@@ -1216,13 +1285,95 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
               <title>{`${activeName} step ${point.step}: ${point.value}`}</title>
             </circle>
           ))}
+          {/* Issue #271: event overlay on a top event axis. Each step with
+              events shows a count badge (filtered event count at that step);
+              clicking toggles an inline detail panel below the chart. Position
+              is derived from the events' own step range, independent of the
+              curve, so events at steps without a metric point still appear. */}
+          {eventSteps.map((step) => {
+            const count = eventsByStep[step].length;
+            const x = eventXOf(step);
+            const isActive = step === activeEventStep;
+            // count == 1 keeps the single event's color; count > 1 uses a
+            // neutral tone so the badge does not misleadingly favor one type.
+            const badgeColor = count === 1 ? EVENT_COLORS[eventsByStep[step][0].type] : EVENT_BADGE_MULTI;
+            return (
+              <g key={step} className="eventBadge" role="button" tabIndex={0} aria-label={`${count} event(s) at step ${step}`} onClick={() => setActiveEventStep(isActive ? null : step)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setActiveEventStep(isActive ? null : step); } }}>
+                <rect x={x - 11} y="4" width="22" height="14" rx="7" fill={isActive ? "#1a2430" : "#0b1118"} stroke={badgeColor} strokeWidth="1.2" />
+                <text x={x} y="14" textAnchor="middle" fontSize="10" fill="#cbd5e1">{count}</text>
+                <title>{`${count} event(s) @ step ${step}`}</title>
+              </g>
+            );
+          })}
         </svg>
+      )}
+      {activeEventStep !== null && activeStepEvents.length > 0 && (
+        <div className="eventPanel">
+          <div className="eventPanelHeader">
+            <b>step {activeEventStep}</b>
+            <span className="eventPanelCount">{activeStepEvents.length} event(s)</span>
+            <button type="button" className="eventCardClose" onClick={() => setActiveEventStep(null)}>×</button>
+          </div>
+          {activeStepEvents.map((event, i) => (
+            <div key={`${event.type}-${i}`} className="eventPanelRow">
+              <i className="eventSwatch" style={{ background: EVENT_COLORS[event.type] }} />
+              <span className="eventPanelType">{EVENT_LABELS[event.type]}</span>
+              <span className="eventPanelMessage">{event.message}</span>
+              {event.log_excerpt && event.log_excerpt.length > 0 && (
+                <pre className="eventExcerpt">{event.log_excerpt.join("\n")}</pre>
+              )}
+            </div>
+          ))}
+        </div>
       )}
       <div className="plotFooter">
         <span>{activeName || "metric"} · {points.length} points</span>
         <span>{metricsDir || "no metrics dir"} · {plot.minLabel} to {plot.maxLabel}</span>
       </div>
     </div>
+  );
+}
+
+function EventFilterDropdown({ eventFilter, setEventFilter, open, setOpen, colors, labels, types }) {
+  // Issue #271: multi-select dropdown for event-type filtering. Independent of
+  // the metric curve (per the issue). Dependency-free: clicking the button
+  // toggles a checkbox popover; clicking outside closes it.
+  const wrapRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDocClick = (event) => {
+      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open, setOpen]);
+  const toggle = (type) => setEventFilter((current) => (current.includes(type) ? current.filter((t) => t !== type) : [...current, type]));
+  return (
+    <span className="eventFilterDropdown" ref={wrapRef}>
+      <button type="button" className="eventFilterBtn" onClick={() => setOpen((v) => !v)}>
+        <Activity size={12} />
+        events {eventFilter.length}/{types.length}
+        <span className="eventFilterCaret">{open ? "▴" : "▾"}</span>
+      </button>
+      {open && (
+        <div className="eventFilterPanel">
+          {types.map((type) => (
+            <div
+              key={type}
+              className={classNames("eventFilterItem", eventFilter.includes(type) && "eventFilterItemActive")}
+              role="checkbox"
+              tabIndex={0}
+              aria-checked={eventFilter.includes(type)}
+              onClick={() => toggle(type)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(type); } }}
+            >
+              <i className="eventSwatch" style={{ background: eventFilter.includes(type) ? colors[type] : "transparent" }} />
+              {labels[type]}
+            </div>
+          ))}
+        </div>
+      )}
+    </span>
   );
 }
 

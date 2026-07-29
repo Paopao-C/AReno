@@ -171,24 +171,55 @@ def detect_events(
                 )
             )
 
-    # --- constant_reward from metric points (rollout/rewards_std ~ 0) ---
+    # --- constant_reward from metric points ---
+    # Intent: flag a reward function that returns the SAME non-zero value every
+    # rollout (likely broken/stubbed). We require (a) rewards_std ~ 0 and (b)
+    # rewards_mean meaningfully non-zero for (c) a run of >= CONSTANT_STREAK
+    # consecutive steps, and emit one event at the start of that run. This
+    # avoids the common false-positive storm during early GRPO, where rewards
+    # are legitimately all zero (std=0, mean=0) until the policy learns enough
+    # to differentiate.
+    CONSTANT_STREAK = 3
+    std_by_step: dict[int, float] = {}
+    mean_by_step: dict[int, float] = {}
     for point in points:
         name = str(point.get("name") or "")
-        if name != "rollout/rewards_std":
-            continue
         value = point.get("value")
         if not _is_finite_number(value):
             continue
-        if float(value) < 1e-8:
-            step = int(point.get("step") or 0)
-            events.append(
-                _make_event(
-                    step=step,
-                    event_type="constant_reward",
-                    severity=SEVERITY_WARNING,
-                    message="reward std ~ 0: every rollout in the group got the same reward",
-                )
+        step = int(point.get("step") or 0)
+        if name == "rollout/rewards_std":
+            std_by_step[step] = float(value)
+        elif name == "rollout/rewards_mean":
+            mean_by_step[step] = float(value)
+    steps_sorted = sorted(set(std_by_step) & set(mean_by_step))
+    # Emit a constant_reward event at the start of any window of CONSTANT_STREAK
+    # consecutive steps whose std~0 and mean is meaningfully non-zero. Emit once
+    # per streak: skip a window whose immediately preceding step already matched
+    # (i.e. that streak was reported starting one step earlier).
+    for i in range(len(steps_sorted) - CONSTANT_STREAK + 1):
+        window = steps_sorted[i : i + CONSTANT_STREAK]
+        if not all(std_by_step[s] < 1e-8 and abs(mean_by_step[s]) > 1e-8 for s in window):
+            continue
+        start_step = window[0]
+        # Emit once per streak: skip if the previous step was already part of a
+        # reported streak (i.e. the window started one step earlier too).
+        if i > 0:
+            prev = steps_sorted[i - 1]
+            if std_by_step[prev] < 1e-8 and abs(mean_by_step[prev]) > 1e-8:
+                continue
+        events.append(
+            _make_event(
+                step=start_step,
+                event_type="constant_reward",
+                severity=SEVERITY_WARNING,
+                message=(
+                    "reward has been constant and non-zero for >= "
+                    f"{CONSTANT_STREAK} steps: the reward function may be "
+                    "returning the same value regardless of completion quality"
+                ),
             )
+        )
 
     events.sort(key=lambda event: (event["step"], event["type"]))
     return events

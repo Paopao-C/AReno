@@ -221,6 +221,35 @@ def detect_events(
             )
         )
 
+    # --- non_finite from metric points ---
+    # TensorBoard records loss as NaN (the dashboard's metric loader skips NaN
+    # for display, so they never reach job.metrics). A train run started outside
+    # the dashboard has no captured logs either, so this scan is the only way to
+    # surface those NaN steps. Skip steps already reported from train_stats.
+    already_nonfinite_steps = {event["step"] for event in events if event["type"] == "non_finite"}
+    nan_by_step: dict[int, set[str]] = {}
+    for point in points:
+        value = point.get("value")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(number) or math.isinf(number):
+            step = int(point.get("step") or 0)
+            nan_by_step.setdefault(step, set()).add(str(point.get("name") or "metric"))
+    for step in sorted(nan_by_step):
+        if step in already_nonfinite_steps:
+            continue
+        tags = sorted(nan_by_step[step])
+        events.append(
+            _make_event(
+                step=step,
+                event_type="non_finite",
+                severity=SEVERITY_ERROR,
+                message=f"non-finite metric value(s): {', '.join(tags)}",
+            )
+        )
+
     events.sort(key=lambda event: (event["step"], event["type"]))
     return events
 
@@ -314,3 +343,44 @@ def detect_events_from_job_artifacts(
     logs = list(log_lines or [])
     stats_rows = parse_train_stats_from_logs(logs)
     return detect_events(train_stats_rows=stats_rows, log_lines=logs, metric_points=metric_points)
+
+
+def collect_nan_metric_points(event_paths: Iterable[Any]) -> list[dict[str, Any]]:
+    """Read TensorBoard event files and return [{step, name, value}] for scalar
+    points whose value is NaN/Inf.
+
+    This is a separate, additional read used only for event detection. The
+    dashboard's normal metric loader (_load_tensorboard_scalars) skips NaN for
+    display, so those points never reach job.metrics; and a train run started
+    outside the dashboard has no captured train_stats logs. Scanning the event
+    files directly is the only way to surface those NaN steps in that case.
+
+    Pure-ish: reads files, never mutates job state or stored data. Lazily
+    imports tensorboard; returns [] on import/read failure so a missing optional
+    dependency never breaks event detection.
+    """
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for path in event_paths:
+        try:
+            acc = EventAccumulator(str(path), size_guidance={"scalars": 10000})
+            acc.Reload()
+            tags = acc.Tags().get("scalars", [])
+        except Exception:
+            continue
+        for tag in tags:
+            try:
+                scalars = acc.Scalars(tag)
+            except Exception:
+                continue
+            for s in scalars:
+                try:
+                    number = float(s.value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isnan(number) or math.isinf(number):
+                    out.append({"step": int(s.step), "name": tag, "value": number})
+    return out

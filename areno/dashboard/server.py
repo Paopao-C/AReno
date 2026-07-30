@@ -27,7 +27,7 @@ from areno.cli.dashboard_registry import GLOBAL_REGISTRY_FILE
 from areno.cli.diagnostics import collect_env, run_checks
 from areno.dashboard.agent_context import agent_system_prompt
 from areno.dashboard.agent_files import AgentFileBrowser
-from areno.dashboard.events import detect_events_from_job_artifacts, filter_events
+from areno.dashboard.events import collect_nan_metric_points, detect_events_from_job_artifacts, filter_events
 
 ROOT = Path(os.environ.get("ARENO_DASHBOARD_ROOT", Path.cwd())).resolve()
 STATIC_DIR = Path(__file__).resolve().parent / "dist"
@@ -528,7 +528,18 @@ class DashboardState:
         job = self.get_job(job_id)
         if job is None:
             return []
-        events = detect_events_from_job_artifacts(log_lines=job.logs, metric_points=job.metrics)
+        # TensorBoard records loss as NaN, but the normal metric loader skips NaN
+        # for display, so those points never reach job.metrics. Read the event
+        # files separately for NaN detection only (no mutation of stored data).
+        # This also covers train runs started outside the dashboard, which have
+        # no captured train_stats logs in job.logs.
+        all_points = list(job.metrics)
+        if job.metrics_dir:
+            metrics_path = (ROOT / job.metrics_dir).resolve()
+            if metrics_path.is_dir():
+                nan_points = collect_nan_metric_points(tensorboard_event_sources(metrics_path, job_pid(job)))
+                all_points.extend(nan_points)
+        events = detect_events_from_job_artifacts(log_lines=job.logs, metric_points=all_points)
         return filter_events(events, event_types)
 
     def scan_registered_jobs(self) -> None:

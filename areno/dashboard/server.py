@@ -534,12 +534,24 @@ class DashboardState:
         # This also covers train runs started outside the dashboard, which have
         # no captured train_stats logs in job.logs.
         all_points = list(job.metrics)
+        # Log lines to scan: the dashboard's own captured stdout (for runs it
+        # started) PLUS a sidecar train.log under metrics_dir for runs started
+        # outside the dashboard (e.g. from a cell with `> metrics_dir/train.log
+        # 2>&1`). oom/invalid_batch events live in stdout, so without this file
+        # a cell-started train would never surface them.
+        log_lines = list(job.logs)
         if job.metrics_dir:
             metrics_path = (ROOT / job.metrics_dir).resolve()
             if metrics_path.is_dir():
                 nan_points = collect_nan_metric_points(tensorboard_event_sources(metrics_path, job_pid(job)))
                 all_points.extend(nan_points)
-        events = detect_events_from_job_artifacts(log_lines=job.logs, metric_points=all_points)
+                train_log = metrics_path / "train.log"
+                if train_log.is_file():
+                    try:
+                        log_lines.extend(train_log.read_text(encoding="utf-8", errors="replace").splitlines())
+                    except Exception:
+                        pass
+        events = detect_events_from_job_artifacts(log_lines=log_lines, metric_points=all_points)
         return filter_events(events, event_types)
 
     def scan_registered_jobs(self) -> None:

@@ -1221,12 +1221,13 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
   const activeName = effectiveName;
   const visiblePoints = points.slice(-240);
   const smoothed = smoothTensorboard(visiblePoints, smooth);
-  const plot = buildMetricPlot(visiblePoints, smoothed);
-  // Issue #271: event overlay lives on its own axis at the chart top. Position
-  // badges by the events' own step range (not the curve's visible window), so a
-  // step that has an event but no metric point (e.g. an OOM step that produced
-  // no loss) still renders its badge. Group filtered events by step for count
-  // badges; clicking a badge expands that step's detail inline.
+  // Issue #271: the chart shares ONE x-axis (step) between the metric curve and
+  // event badges. The range is the union of the visible metric points' steps
+  // and the event steps, so:
+  //   - when loss goes NaN early the curve has few points but the axis still
+  //     extends to the event steps, and NaN badges render at their true x;
+  //   - when events sit at steps the curve never reached (OOM with no loss
+  //     point), badges still appear at the right position.
   const filteredEvents = events.filter((event) => eventFilter.includes(event.type));
   const eventsByStep = useMemo(() => {
     const grouped = {};
@@ -1236,13 +1237,43 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
     return grouped;
   }, [filteredEvents]);
   const eventSteps = Object.keys(eventsByStep).map(Number).sort((a, b) => a - b);
-  const eventStepMin = eventSteps.length ? eventSteps[0] : 0;
-  const eventStepMax = eventSteps.length ? eventSteps[eventSteps.length - 1] : 1;
-  const eventStepSpan = Math.max(eventStepMax - eventStepMin, 1);
-  const eventXOf = (step) => {
-    if (!eventSteps.length) return 0;
-    return ((step - eventStepMin) / eventStepSpan) * 700 + 10;
-  };
+  const curveMinStep = visiblePoints.length ? visiblePoints[0].step : null;
+  const curveMaxStep = visiblePoints.length ? visiblePoints[visiblePoints.length - 1].step : null;
+  const allSteps = [curveMinStep, curveMaxStep, eventSteps.length ? eventSteps[0] : null, eventSteps.length ? eventSteps[eventSteps.length - 1] : null].filter((s) => s !== null);
+  const chartStepMin = allSteps.length ? Math.min(...allSteps) : 0;
+  const chartStepMax = allSteps.length ? Math.max(...allSteps) : 1;
+  const chartStepSpan = Math.max(chartStepMax - chartStepMin, 1);
+  const hasEvents = eventSteps.length > 0;
+  // Only pass a custom step range when there are events; otherwise keep the
+  // original (curve-only) behavior so the no-event path is unchanged.
+  const plot = buildMetricPlot(visiblePoints, smoothed, hasEvents ? { min: chartStepMin, max: chartStepMax } : undefined);
+  const eventXOf = (step) => ((step - chartStepMin) / chartStepSpan) * 700 + 10;
+  // Aggregate events into display segments: a run of >= AGGREGATE_MIN consecutive
+  // steps becomes one colored band labelled with its step range (avoids hundreds
+  // of stacked badges when, say, loss is NaN for 1000 steps); shorter runs stay
+  // as single-step badges. Each segment tracks its dominant event type.
+  const AGGREGATE_MIN = 3;
+  const eventSegments = useMemo(() => {
+    const segs = [];
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      if (run.length >= AGGREGATE_MIN) {
+        const types = run.map((s) => eventsByStep[s][0].type);
+        const type = types.sort((a, b) => types.filter((t) => t === b).length - types.filter((t) => t === a).length)[0];
+        segs.push({ start: run[0], end: run[run.length - 1], count: run.length, type, aggregated: true });
+      } else {
+        for (const s of run) segs.push({ start: s, end: s, count: eventsByStep[s].length, type: eventsByStep[s][0].type, aggregated: false });
+      }
+      run = [];
+    };
+    for (const step of eventSteps) {
+      if (run.length && step === run[run.length - 1] + 1) run.push(step);
+      else { flush(); run = [step]; }
+    }
+    flush();
+    return segs;
+  }, [eventSteps, eventsByStep]);
   const EVENT_COLORS = { non_finite: "#e07b7b", oom: "#b07bed", invalid_batch: "#e0c24a", constant_reward: "#6bb4e9" };
   const EVENT_BADGE_MULTI = "#9aa6b2"; // neutral grey for steps with >1 event
   const EVENT_LABELS = { non_finite: "NaN", oom: "OOM", invalid_batch: "invalid", constant_reward: "const" };
@@ -1274,38 +1305,54 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
       {visiblePoints.length === 0 ? (
         <div className="plotEmpty">{metricLoading ? "Loading selected metric..." : "No TensorBoard scalar points loaded yet."}</div>
       ) : (
-        <svg className="metricPlot" viewBox="0 0 720 180" role="img">
-          <g className="plotGrid">
-            {[0, 1, 2, 3].map((item) => <line key={item} x1="0" x2="720" y1={30 + item * 42} y2={30 + item * 42} />)}
-          </g>
-          <polyline className="rawLine" points={plot.raw} />
-          <polyline className="smoothLine" points={plot.smooth} />
-          {visiblePoints.slice(-24).map((point, index) => (
-            <circle key={`${point.step}-${index}`} cx={plot.coords[index + Math.max(0, visiblePoints.length - 24)]?.x || 0} cy={plot.coords[index + Math.max(0, visiblePoints.length - 24)]?.y || 0} r="2.2">
-              <title>{`${activeName} step ${point.step}: ${point.value}`}</title>
-            </circle>
-          ))}
-          {/* Issue #271: event overlay on a top event axis. Each step with
-              events shows a count badge (filtered event count at that step);
-              clicking toggles an inline detail panel below the chart. Position
-              is derived from the events' own step range, independent of the
-              curve, so events at steps without a metric point still appear. */}
-          {eventSteps.map((step) => {
-            const count = eventsByStep[step].length;
-            const x = eventXOf(step);
-            const isActive = step === activeEventStep;
-            // count == 1 keeps the single event's color; count > 1 uses a
-            // neutral tone so the badge does not misleadingly favor one type.
-            const badgeColor = count === 1 ? EVENT_COLORS[eventsByStep[step][0].type] : EVENT_BADGE_MULTI;
-            return (
-              <g key={step} className="eventBadge" role="button" tabIndex={0} aria-label={`${count} event(s) at step ${step}`} onClick={() => setActiveEventStep(isActive ? null : step)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setActiveEventStep(isActive ? null : step); } }}>
-                <rect x={x - 11} y="4" width="22" height="14" rx="7" fill={isActive ? "#1a2430" : "#0b1118"} stroke={badgeColor} strokeWidth="1.2" />
-                <text x={x} y="14" textAnchor="middle" fontSize="10" fill="#cbd5e1">{count}</text>
-                <title>{`${count} event(s) @ step ${step}`}</title>
-              </g>
-            );
-          })}
-        </svg>
+        <>
+          {/* Issue #271: a dedicated event timeline shares the curve's step
+              x-axis but lives on its own row, so events render even when the
+              curve is empty (e.g. loss NaN from step 1). Consecutive runs of
+              >= AGGREGATE_MIN steps collapse into one color band; isolated
+              events stay as count badges. Clicking opens the inline detail. */}
+          {hasEvents && (
+            <svg className="eventTimeline" viewBox="0 0 720 22" role="img" aria-label="training event timeline">
+              {eventSegments.map((seg) => {
+                const xStart = eventXOf(seg.start);
+                const xEnd = eventXOf(seg.end);
+                const isActive = activeEventStep !== null && seg.start <= activeEventStep && activeEventStep <= seg.end;
+                const setOpen = () => setActiveEventStep(isActive ? null : seg.start);
+                if (seg.aggregated) {
+                  const width = Math.max(xEnd - xStart, 6);
+                  return (
+                    <g key={`${seg.start}-${seg.end}`} className="eventBand" role="button" tabIndex={0} aria-label={`${seg.count} ${seg.type} events, steps ${seg.start} to ${seg.end}`} onClick={setOpen} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpen(); } }}>
+                      <rect x={xStart} y="4" width={width} height="14" rx="3" fill={EVENT_COLORS[seg.type]} opacity={isActive ? 0.95 : 0.6} />
+                      <text x={(xStart + xEnd) / 2} y="14" textAnchor="middle" fontSize="9" fill="#0b1118">{seg.start}–{seg.end}</text>
+                      <title>{`${seg.count} ${EVENT_LABELS[seg.type]} event(s), steps ${seg.start}-${seg.end}`}</title>
+                    </g>
+                  );
+                }
+                const x = eventXOf(seg.start);
+                const badgeColor = seg.count === 1 ? EVENT_COLORS[seg.type] : EVENT_BADGE_MULTI;
+                return (
+                  <g key={seg.start} className="eventBadge" role="button" tabIndex={0} aria-label={`${seg.count} event(s) at step ${seg.start}`} onClick={setOpen} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpen(); } }}>
+                    <rect x={x - 11} y="4" width="22" height="14" rx="7" fill={isActive ? "#1a2430" : "#0b1118"} stroke={badgeColor} strokeWidth="1.2" />
+                    <text x={x} y="14" textAnchor="middle" fontSize="10" fill="#cbd5e1">{seg.count}</text>
+                    <title>{`${seg.count} event(s) @ step ${seg.start}`}</title>
+                  </g>
+                );
+              })}
+            </svg>
+          )}
+          <svg className="metricPlot" viewBox="0 0 720 180" role="img">
+            <g className="plotGrid">
+              {[0, 1, 2, 3].map((item) => <line key={item} x1="0" x2="720" y1={30 + item * 42} y2={30 + item * 42} />)}
+            </g>
+            <polyline className="rawLine" points={plot.raw} />
+            <polyline className="smoothLine" points={plot.smooth} />
+            {visiblePoints.slice(-24).map((point, index) => (
+              <circle key={`${point.step}-${index}`} cx={plot.coords[index + Math.max(0, visiblePoints.length - 24)]?.x || 0} cy={plot.coords[index + Math.max(0, visiblePoints.length - 24)]?.y || 0} r="2.2">
+                <title>{`${activeName} step ${point.step}: ${point.value}`}</title>
+              </circle>
+            ))}
+          </svg>
+        </>
       )}
       {activeEventStep !== null && activeStepEvents.length > 0 && (
         <div className="eventPanel">
@@ -1387,14 +1434,19 @@ function smoothTensorboard(points, smooth) {
   });
 }
 
-function buildMetricPlot(rawPoints, smoothPoints) {
+function buildMetricPlot(rawPoints, smoothPoints, stepRange) {
   if (!rawPoints.length) return { raw: "", smooth: "", coords: [], minLabel: "n/a", maxLabel: "n/a" };
   const allValues = [...rawPoints, ...smoothPoints].map((point) => point.value);
   const min = Math.min(...allValues);
   const max = Math.max(...allValues);
   const span = Math.max(max - min, 1e-9);
-  const stepMin = rawPoints[0].step;
-  const stepMax = rawPoints[rawPoints.length - 1].step;
+  // Issue #271: allow an externally-supplied step range so the curve can share
+  // the chart's x-axis with event badges (e.g. when loss goes NaN early, the
+  // few finite points must still plot at the correct x relative to the events'
+  // steps, not stretched across the full width). Falls back to the points'
+  // own range when not supplied (original behavior).
+  const stepMin = stepRange ? stepRange.min : rawPoints[0].step;
+  const stepMax = stepRange ? stepRange.max : rawPoints[rawPoints.length - 1].step;
   const stepSpan = Math.max(stepMax - stepMin, 1);
   const coord = (point) => ({
     x: ((point.step - stepMin) / stepSpan) * 700 + 10,
